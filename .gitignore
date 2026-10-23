@@ -3,3 +3,5 @@
 !.env.example
 node_modules/
 npm-debug.log*
+/dashboard/dist/
+/dashboard/*.tsbuildinfo

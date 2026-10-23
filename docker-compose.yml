@@ -6,6 +6,7 @@ services:
       PORT: "3000"
       RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:?Set RUNNER_SERVICE_TOKEN in .env}
       RUNNER_MAX_REQUESTS_PER_SECOND: ${RUNNER_MAX_REQUESTS_PER_SECOND:-1000}
+      RUNNER_ALLOWED_TARGET_HOSTS: ${RUNNER_ALLOWED_TARGET_HOSTS:-sfm-backend,sfm-be,localhost,127.0.0.1,::1,host.docker.internal}
       SFM_BE_URL: ${SFM_BE_URL:-http://sfm-backend:8080}
       K6_PROMETHEUS_RW_SERVER_URL: ${K6_PROMETHEUS_RW_SERVER_URL:-http://sfm-prometheus:9090/api/v1/write}
       K6_PROMETHEUS_RW_TREND_STATS: ${K6_PROMETHEUS_RW_TREND_STATS:-p(95)}
@@ -14,6 +15,8 @@ services:
     networks:
       - runner-control
       - sfm-upstream
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     cpus: 1.0
     mem_limit: 512m
     read_only: true
@@ -25,9 +28,43 @@ services:
       - ALL
     restart: unless-stopped
 
+  performance-lab:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: sfm-performance-lab
+    environment:
+      PORT: "4173"
+      RUNNER_BASE_URL: http://k6-runner:3000
+      RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:?Set RUNNER_SERVICE_TOKEN in .env}
+      RUNNER_MAX_REQUESTS_PER_SECOND: ${RUNNER_MAX_REQUESTS_PER_SECOND:-1000}
+      RUNNER_ALLOWED_TARGET_HOSTS: ${RUNNER_ALLOWED_TARGET_HOSTS:-sfm-backend,sfm-be,localhost,127.0.0.1,::1,host.docker.internal}
+      DASHBOARD_ALLOWED_TARGET_URLS: ${DASHBOARD_ALLOWED_TARGET_URLS:-http://sfm-backend:8080,http://host.docker.internal:8080}
+      DASHBOARD_DEFAULT_TARGET_URL: ${DASHBOARD_DEFAULT_TARGET_URL:-http://sfm-backend:8080}
+    depends_on:
+      k6-runner:
+        condition: service_started
+    networks:
+      - runner-control
+      - dashboard-edge
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-4173}:4173"
+    cpus: 0.5
+    mem_limit: 256m
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
 networks:
   runner-control:
     internal: true
+  dashboard-edge:
+    driver: bridge
   sfm-upstream:
     external: true
     name: ${SFM_DOCKER_NETWORK:-sfm-network}

@@ -4,7 +4,8 @@ const http = require('node:http');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { validateStartConfig, HARD_MAX_REQUESTS_PER_SECOND } = require('./config');
+const { validateStartConfig, HARD_MAX_REQUESTS_PER_SECOND, DEFAULT_TARGET_HOSTS } = require('./config');
+const { emptyMetrics, parseK6Summary } = require('./metrics');
 
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.RUNNER_SERVICE_TOKEN;
@@ -13,6 +14,9 @@ const MAX_TEST_MS = 60 * 60 * 1000 + 30 * 1000;
 const STOP_GRACE_MS = 5000;
 const OUTPUT_LIMIT = 4096;
 const MAX_REQUESTS_PER_SECOND = Number(process.env.RUNNER_MAX_REQUESTS_PER_SECOND || HARD_MAX_REQUESTS_PER_SECOND);
+const TARGET_HOSTS = new Set((process.env.RUNNER_ALLOWED_TARGET_HOSTS || DEFAULT_TARGET_HOSTS.join(','))
+  .split(',').map((host) => host.trim().toLowerCase().replace(/^\[|\]$/g, '')).filter(Boolean));
+const DEFAULT_TARGET_BASE_URL = process.env.SFM_BE_URL || 'http://sfm-backend:8080';
 let active = null;
 let latest = null;
 
@@ -30,7 +34,7 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function reject(res, req, status, code, reason, message, details) {
+function reject(res, req, status, code, reason, message, details, diagnostic = {}) {
   console.warn(JSON.stringify({
     event: 'request_rejected',
     method: req.method,
@@ -38,6 +42,7 @@ function reject(res, req, status, code, reason, message, details) {
     httpStatus: status,
     errorCode: code,
     reason,
+    ...diagnostic,
   }));
   return json(res, status, { error: { code, message, ...(details ? { details } : {}) } });
 }
@@ -68,13 +73,14 @@ function readBody(req) {
 
 function publicStatus() {
   const run = active || latest;
-  if (!run) return { status: 'idle', running: false, testId: null, scenario: null, target: null, mode: null, requestsPerSecond: null, vus: null, effectiveVUs: null, preAllocatedVUs: null, maxVUs: null, durationSeconds: null, droppedIterations: null, startedAt: null, finishedAt: null, exitCode: null };
+  if (!run) return { status: 'idle', running: false, testId: null, scenario: null, target: null, targetApiUrl: null, mode: null, requestsPerSecond: null, vus: null, effectiveVUs: null, preAllocatedVUs: null, maxVUs: null, durationSeconds: null, droppedIterations: null, metrics: emptyMetrics(), startedAt: null, finishedAt: null, exitCode: null };
   return {
     status: active ? 'running' : run.status,
     running: Boolean(active),
     testId: run.id,
     scenario: run.scenario,
     target: run.target,
+    targetApiUrl: run.baseUrl,
     mode: run.mode,
     requestsPerSecond: run.requestsPerSecond,
     vus: run.vus,
@@ -83,6 +89,7 @@ function publicStatus() {
     maxVUs: run.maxVUs,
     durationSeconds: run.durationSeconds,
     droppedIterations: run.droppedIterations,
+    metrics: run.metrics,
     startedAt: run.startedAt,
     finishedAt: run.finishedAt,
     exitCode: run.exitCode,
@@ -91,7 +98,7 @@ function publicStatus() {
   };
 }
 
-function redactOutput(value) {
+function redactOutput(value, run) {
   let safe = value;
   for (const secret of [
     TOKEN,
@@ -99,6 +106,7 @@ function redactOutput(value) {
     process.env.K6_PROMETHEUS_RW_USERNAME,
     process.env.K6_PROMETHEUS_RW_SERVER_URL,
     process.env.SFM_BE_URL,
+    run.baseUrl,
   ]) {
     if (secret && secret.length > 0) safe = safe.split(secret).join('[REDACTED]');
   }
@@ -108,9 +116,11 @@ function redactOutput(value) {
 }
 
 function appendOutput(run, stream, chunk) {
-  const combined = redactOutput(`${run[stream]}${chunk.toString()}`);
+  const combined = redactOutput(`${run[stream]}${chunk.toString()}`, run);
   run[stream] = combined.length > OUTPUT_LIMIT ? combined.slice(-OUTPUT_LIMIT) : combined;
-  const match = /dropped_iterations(?:_total)?[^\n]*?:\s*([\d,]+)/i.exec(`${run.stdout}\n${run.stderr}`);
+  const output = `${run.stdout}\n${run.stderr}`;
+  run.metrics = parseK6Summary(output);
+  const match = /dropped_iterations(?:_total)?[^\n]*?:\s*([\d,]+)/i.exec(output);
   if (match) run.droppedIterations = Number(match[1].replaceAll(',', ''));
 }
 
@@ -172,12 +182,21 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/start') {
     const body = await readBody(req).catch((e) => e);
     if (body instanceof Error) return reject(res, req, body.status || 400, 'INVALID_JSON', 'body_must_be_valid_json', body.message);
-    if (!body || Array.isArray(body) || typeof body !== 'object') return reject(res, req, 400, 'INVALID_REQUEST_BODY', 'body_must_be_json_object', 'Body must be a JSON object');
     if (body === null || Array.isArray(body) || typeof body !== 'object') return reject(res, req, 400, 'INVALID_REQUEST_BODY', 'body_must_be_json_object', 'Body must be a JSON object');
-    const validated = validateStartConfig(body, MAX_REQUESTS_PER_SECOND);
+    const validated = validateStartConfig(body, MAX_REQUESTS_PER_SECOND, TARGET_HOSTS, DEFAULT_TARGET_BASE_URL);
     if (validated.error) {
       const { status, code, reason, message, details } = validated.error;
-      return reject(res, req, status, code, reason, message, details);
+      return reject(res, req, status, code, reason, message, details, {
+        payloadShape: {
+          scenarioPresent: Object.hasOwn(body, 'scenario'),
+          targetPresent: Object.hasOwn(body, 'target'),
+          modePresent: Object.hasOwn(body, 'mode'),
+          vusPresent: Object.hasOwn(body, 'vus'),
+          requestsPerSecondPresent: Object.hasOwn(body, 'requestsPerSecond'),
+          durationSecondsPresent: Object.hasOwn(body, 'durationSeconds'),
+          baseUrlPresent: Object.hasOwn(body, 'baseUrl'),
+        },
+      });
     }
     if (active) return reject(res, req, 409, 'TEST_ALREADY_RUNNING', 'single_active_test_limit_reached', 'A test is already running', { testId: active.id });
     const config = validated.value;
@@ -186,7 +205,7 @@ const server = http.createServer(async (req, res) => {
       id: crypto.randomUUID(), ...config,
       startedAt: new Date().toISOString(), finishedAt: null, exitCode: null,
       status: 'running', stopping: false, stopRequested: false,
-      stdout: '', stderr: '', finished: false, droppedIterations: null,
+      stdout: '', stderr: '', finished: false, droppedIterations: null, metrics: emptyMetrics(),
     };
     const args = [
       'run', '--quiet',
@@ -206,7 +225,12 @@ const server = http.createServer(async (req, res) => {
       args.push('--env', `PRE_ALLOCATED_VUS=${run.preAllocatedVUs}`);
       args.push('--env', `MAX_VUS=${run.maxVUs}`);
     }
-    const env = { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', BASE_URL: process.env.SFM_BE_URL || 'http://sfm-backend:8080' };
+    const env = {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME || '/tmp',
+      BASE_URL: run.baseUrl,
+      K6_TARGET_HOST_ALLOWLIST: [...TARGET_HOSTS].join(','),
+    };
     if (process.env.K6_PROMETHEUS_RW_SERVER_URL) {
       args.push('--out', 'experimental-prometheus-rw');
       env.K6_PROMETHEUS_RW_SERVER_URL = process.env.K6_PROMETHEUS_RW_SERVER_URL;
@@ -234,7 +258,7 @@ const server = http.createServer(async (req, res) => {
       run.exitSignal = signal;
       finish(run);
     });
-    return json(res, 202, { started: true, id: run.id, scenario: run.scenario, target: run.target, mode: run.mode, requestsPerSecond: run.requestsPerSecond, vus: run.vus, effectiveVUs: run.effectiveVUs, preAllocatedVUs: run.preAllocatedVUs, maxVUs: run.maxVUs, durationSeconds: run.durationSeconds });
+    return json(res, 202, { started: true, id: run.id, scenario: run.scenario, target: run.target, targetApiUrl: run.baseUrl, mode: run.mode, requestsPerSecond: run.requestsPerSecond, vus: run.vus, effectiveVUs: run.effectiveVUs, preAllocatedVUs: run.preAllocatedVUs, maxVUs: run.maxVUs, durationSeconds: run.durationSeconds });
   }
 });
 

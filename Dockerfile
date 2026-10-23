@@ -6,6 +6,7 @@ WORKDIR /app
 COPY --from=k6 /usr/bin/k6 /usr/local/bin/k6
 COPY runner/package.json ./runner/package.json
 COPY runner/config.js ./runner/config.js
+COPY runner/metrics.js ./runner/metrics.js
 COPY runner/server.js ./runner/server.js
 COPY scripts/load-test.js ./scripts/load-test.js
 RUN addgroup -S runner && adduser -S -G runner runner \
