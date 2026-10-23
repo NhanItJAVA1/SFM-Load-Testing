@@ -13,9 +13,11 @@ All control endpoints require `Authorization: Bearer <RUNNER_SERVICE_TOKEN>`. `/
 | GET | `/status` | — | Report active or most recent in-memory run |
 | GET | `/health` | — | Liveness |
 
-Scenarios are fixed: smoke (1 VU, 30s), load (10 VUs, 300s), stress (25 VUs, 600s), and spike (50 VUs, 120s). `vus` (1–1000) and `durationSeconds` (10–3600) are optional integer overrides and default independently from the selected scenario. A hard 60 minute, 30 second runner timeout allows the maximum requested duration to finish and stops any remaining run. Targets are `ping` (`/api/v1/load-test/ping`), `database` (`/api/v1/load-test/database`), and `redis` (`/api/v1/load-test/redis`) on the configured SFM-BE base URL. The default base URL is `http://sfm-backend:8080`; `SFM_BE_URL` can override it with an allowlisted local host. Unknown request fields, scenarios, and targets are rejected.
+For fixed concurrent users, the legacy body above still works with `mode` omitted. To request an arrival rate, send `{"scenario":"smoke","target":"ping","mode":"request_rate","requestsPerSecond":20,"durationSeconds":60}`. `requestsPerSecond` is rejected unless mode is `request_rate`; `vus` is rejected in that mode because Runner computes bounded allocation values.
 
-`GET /status` returns `status` (`idle`, `running`, `completed`, `stopped`, or `failed`), test ID, scenario, target, effective VUs and duration, start/finish times, exit code, and the latest bounded stdout/stderr diagnostics. Only the most recent finished run is retained in memory. Each output stream is capped at 4 KiB and known credentials are redacted. A nonzero k6 exit, spawn error, remote-write output error, or runner timeout is reported as `failed`; a successful exit is `completed`; a user stop is `stopped`.
+Scenarios are fixed: smoke (1 VU, 30s), load (10 VUs, 300s), stress (25 VUs, 600s), and spike (50 VUs, 120s). If `mode` is omitted, Runner preserves the existing `concurrent_users` behavior. `concurrent_users` accepts `vus` (1–1000); both `vus` and `durationSeconds` default independently from the selected scenario. `durationSeconds` is 10–3600 for either mode. `request_rate` requires integer `requestsPerSecond` and accepts no `vus` field. Its configurable safety ceiling defaults to 1000 RPS via `RUNNER_MAX_REQUESTS_PER_SECOND` (valid 1–1000); this is a requested arrival rate, not a guarantee of achieved throughput.\n\nFor request-rate allocation, Runner uses `preAllocatedVUs = min(100, max(1, ceil(requestsPerSecond / 10)))` and `maxVUs = min(250, max(preAllocatedVUs, ceil(requestsPerSecond / 4)))`. This bounds k6 rate-mode VUs to 100 preallocated and 250 maximum. Each iteration makes exactly one request to the chosen allowlisted target. If k6 drops iterations, actual RPS can be lower than requested. A hard 60 minute, 30 second Runner timeout allows the maximum requested duration to finish and stops any remaining run. The default base URL is `http://sfm-backend:8080`; `SFM_BE_URL` can override it with an allowlisted local host. Unknown request fields, scenarios, modes, targets, and mode-specific parameters are rejected.
+
+`GET /status` returns `status` (`idle`, `running`, `completed`, `stopped`, or `failed`), test ID, scenario, target, mode, requested RPS, effective VUs (plus preallocated/max VUs), duration, droppedIterations when available, start/finish times, exit code, and the latest bounded stdout/stderr diagnostics. Only the most recent finished run is retained in memory. Each output stream is capped at 4 KiB and known credentials are redacted. A nonzero k6 exit, spawn error, remote-write output error, or runner timeout is reported as `failed`; a successful exit is `completed`; a user stop is `stopped`.
 
 The runner has no API for URLs, scripts, commands, or file paths. VUs and duration can only be set within the stated integer bounds. Its k6 process is spawned with a fixed executable, fixed script, selected enum values, and `shell: false`. Rejected requests produce structured error codes; safe JSON logs include the route, HTTP status, error code, and fixed validation reason without logging request values or tokens. Process output is available only through the authenticated status endpoint, is bounded to 4 KiB per stream, and redacts the service token, backend URL, and Prometheus credentials/URL. The service token must be at least 32 characters. Keep it in deployment secrets and never commit `.env`.
 
@@ -43,6 +45,8 @@ The token generated above is 64 characters. Ensure the SFM-BE container is reach
 docker compose build
 docker compose up -d
 ```
+
+After changing Runner code, rebuild and recreate it with `docker compose up -d --build k6-runner`. Optionally set `RUNNER_MAX_REQUESTS_PER_SECOND=500` in `.env` to lower the accepted RPS ceiling; the hard maximum is 1000.
 
 The runner attaches to an `internal: true` control network and the shared upstream network. Compose does not publish a host port. For local operator access only, use `docker compose exec` with an HTTP client in an operator container, or add a temporary loopback-only port mapping in a local override file. Do not bind the service to a public interface or route it through an Internet-facing proxy. Only attach trusted internal services to the shared network.
 
@@ -125,6 +129,17 @@ k6_vus{testid="<test-id>"}
 ```
 
 The P95 gauge is exported per k6 remote-write aggregation interval; the query above shows its most recent sample in milliseconds. Leave Prometheus' existing TSDB retention and storage configuration unchanged; the Runner adds no persistence layer.
+
+The request-rate mode was also run against `ping` at a requested 5 RPS for 10 seconds. It completed successfully (exit code 0), and Prometheus observed `k6_http_reqs_total=51`, `k6_http_req_duration_p95=0.0032819409999999996` seconds, `k6_http_req_failed_rate=0`, and `k6_vus=1`; those series included `mode="request_rate"` and the run's `testid`. Query the selected run using, for example:
+
+```promql
+sum(rate(k6_http_reqs_total{testid="<test-id>",mode="request_rate"}[1m]))
+k6_http_req_duration_p95{testid="<test-id>",mode="request_rate"} * 1000
+k6_http_req_failed_rate{testid="<test-id>",mode="request_rate"}
+k6_vus{testid="<test-id>",mode="request_rate"}
+```
+
+`dropped_iterations` is a built-in k6 metric and will be reported in Runner status if it appears in captured k6 output. With this short successful run, Prometheus had no dropped-iteration series because no drops were observed.
 
 ## Limits and operations
 

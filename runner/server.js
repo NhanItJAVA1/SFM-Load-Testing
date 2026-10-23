@@ -4,6 +4,7 @@ const http = require('node:http');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { validateStartConfig, HARD_MAX_REQUESTS_PER_SECOND } = require('./config');
 
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.RUNNER_SERVICE_TOKEN;
@@ -11,19 +12,16 @@ const SCRIPT = path.resolve(__dirname, '..', 'scripts', 'load-test.js');
 const MAX_TEST_MS = 60 * 60 * 1000 + 30 * 1000;
 const STOP_GRACE_MS = 5000;
 const OUTPUT_LIMIT = 4096;
-const MAX_VUS = 1000;
-const scenarios = Object.freeze({
-  smoke: { vus: 1, durationSeconds: 30 },
-  load: { vus: 10, durationSeconds: 300 },
-  stress: { vus: 25, durationSeconds: 600 },
-  spike: { vus: 50, durationSeconds: 120 },
-});
-const targets = new Set(['ping', 'database', 'redis']);
+const MAX_REQUESTS_PER_SECOND = Number(process.env.RUNNER_MAX_REQUESTS_PER_SECOND || HARD_MAX_REQUESTS_PER_SECOND);
 let active = null;
 let latest = null;
 
 if (!TOKEN || TOKEN.length < 32) {
   console.error('RUNNER_SERVICE_TOKEN must be set to at least 32 characters.');
+  process.exit(1);
+}
+if (!Number.isInteger(MAX_REQUESTS_PER_SECOND) || MAX_REQUESTS_PER_SECOND < 1 || MAX_REQUESTS_PER_SECOND > HARD_MAX_REQUESTS_PER_SECOND) {
+  console.error(`RUNNER_MAX_REQUESTS_PER_SECOND must be an integer from 1 to ${HARD_MAX_REQUESTS_PER_SECOND}.`);
   process.exit(1);
 }
 
@@ -70,15 +68,21 @@ function readBody(req) {
 
 function publicStatus() {
   const run = active || latest;
-  if (!run) return { status: 'idle', running: false, testId: null, scenario: null, target: null, vus: null, durationSeconds: null, startedAt: null, finishedAt: null, exitCode: null };
+  if (!run) return { status: 'idle', running: false, testId: null, scenario: null, target: null, mode: null, requestsPerSecond: null, vus: null, effectiveVUs: null, preAllocatedVUs: null, maxVUs: null, durationSeconds: null, droppedIterations: null, startedAt: null, finishedAt: null, exitCode: null };
   return {
     status: active ? 'running' : run.status,
     running: Boolean(active),
     testId: run.id,
     scenario: run.scenario,
     target: run.target,
+    mode: run.mode,
+    requestsPerSecond: run.requestsPerSecond,
     vus: run.vus,
+    effectiveVUs: run.effectiveVUs,
+    preAllocatedVUs: run.preAllocatedVUs,
+    maxVUs: run.maxVUs,
     durationSeconds: run.durationSeconds,
+    droppedIterations: run.droppedIterations,
     startedAt: run.startedAt,
     finishedAt: run.finishedAt,
     exitCode: run.exitCode,
@@ -106,6 +110,8 @@ function redactOutput(value) {
 function appendOutput(run, stream, chunk) {
   const combined = redactOutput(`${run[stream]}${chunk.toString()}`);
   run[stream] = combined.length > OUTPUT_LIMIT ? combined.slice(-OUTPUT_LIMIT) : combined;
+  const match = /dropped_iterations(?:_total)?[^\n]*?:\s*([\d,]+)/i.exec(`${run.stdout}\n${run.stderr}`);
+  if (match) run.droppedIterations = Number(match[1].replaceAll(',', ''));
 }
 
 function finish(run) {
@@ -167,40 +173,39 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req).catch((e) => e);
     if (body instanceof Error) return reject(res, req, body.status || 400, 'INVALID_JSON', 'body_must_be_valid_json', body.message);
     if (!body || Array.isArray(body) || typeof body !== 'object') return reject(res, req, 400, 'INVALID_REQUEST_BODY', 'body_must_be_json_object', 'Body must be a JSON object');
-    const allowedKeys = ['scenario', 'target', 'vus', 'durationSeconds'];
-    const unknown = Object.keys(body).filter((key) => !allowedKeys.includes(key));
-    if (unknown.length) return reject(res, req, 400, 'UNKNOWN_PARAMETER', 'configuration_key_not_allowlisted', 'Request contains an unsupported configuration parameter', { allowed: allowedKeys });
-    if (!Object.hasOwn(body, 'scenario') || !Object.hasOwn(body, 'target')) return reject(res, req, 400, 'MISSING_REQUIRED_FIELD', 'scenario_and_target_are_required', 'scenario and target are required', { required: ['scenario', 'target'] });
-    if (!Object.hasOwn(scenarios, body.scenario)) return reject(res, req, 400, 'UNKNOWN_SCENARIO', 'scenario_not_allowlisted', 'Unknown scenario', { allowed: Object.keys(scenarios) });
-    if (!targets.has(body.target)) return reject(res, req, 400, 'UNKNOWN_TARGET', 'target_not_allowlisted', 'Unknown target', { allowed: [...targets] });
-    if (body.vus !== undefined && (!Number.isInteger(body.vus) || body.vus < 1 || body.vus > MAX_VUS)) {
-      return reject(res, req, 400, 'INVALID_VUS', 'vus_must_be_integer_in_range', `vus must be an integer from 1 to ${MAX_VUS}`, { field: 'vus', minimum: 1, maximum: MAX_VUS });
-    }
-    if (body.durationSeconds !== undefined && (!Number.isInteger(body.durationSeconds) || body.durationSeconds < 10 || body.durationSeconds > 3600)) {
-      return reject(res, req, 400, 'INVALID_DURATION_SECONDS', 'duration_seconds_must_be_integer_in_range', 'durationSeconds must be an integer from 10 to 3600', { field: 'durationSeconds', minimum: 10, maximum: 3600 });
+    if (body === null || Array.isArray(body) || typeof body !== 'object') return reject(res, req, 400, 'INVALID_REQUEST_BODY', 'body_must_be_json_object', 'Body must be a JSON object');
+    const validated = validateStartConfig(body, MAX_REQUESTS_PER_SECOND);
+    if (validated.error) {
+      const { status, code, reason, message, details } = validated.error;
+      return reject(res, req, status, code, reason, message, details);
     }
     if (active) return reject(res, req, 409, 'TEST_ALREADY_RUNNING', 'single_active_test_limit_reached', 'A test is already running', { testId: active.id });
-
-    const defaults = scenarios[body.scenario];
-    const vus = body.vus === undefined ? defaults.vus : body.vus;
-    const durationSeconds = body.durationSeconds === undefined ? defaults.durationSeconds : body.durationSeconds;
+    const config = validated.value;
 
     const run = {
-      id: crypto.randomUUID(), scenario: body.scenario, target: body.target, vus, durationSeconds,
+      id: crypto.randomUUID(), ...config,
       startedAt: new Date().toISOString(), finishedAt: null, exitCode: null,
       status: 'running', stopping: false, stopRequested: false,
-      stdout: '', stderr: '', finished: false,
+      stdout: '', stderr: '', finished: false, droppedIterations: null,
     };
     const args = [
       'run', '--quiet',
       '--tag', `testid=${run.id}`,
       '--tag', `scenario=${run.scenario}`,
       '--tag', `target=${run.target}`,
+      '--tag', `mode=${run.mode}`,
       '--env', `SCENARIO=${run.scenario}`,
       '--env', `TARGET=${run.target}`,
-      '--env', `VUS=${run.vus}`,
+      '--env', `MODE=${run.mode}`,
+      '--env', `VUS=${run.effectiveVUs}`,
       '--env', `DURATION_SECONDS=${run.durationSeconds}`,
+      '--env', `MAX_REQUESTS_PER_SECOND=${MAX_REQUESTS_PER_SECOND}`,
     ];
+    if (run.mode === 'request_rate') {
+      args.push('--env', `REQUESTS_PER_SECOND=${run.requestsPerSecond}`);
+      args.push('--env', `PRE_ALLOCATED_VUS=${run.preAllocatedVUs}`);
+      args.push('--env', `MAX_VUS=${run.maxVUs}`);
+    }
     const env = { PATH: process.env.PATH, HOME: process.env.HOME || '/tmp', BASE_URL: process.env.SFM_BE_URL || 'http://sfm-backend:8080' };
     if (process.env.K6_PROMETHEUS_RW_SERVER_URL) {
       args.push('--out', 'experimental-prometheus-rw');
@@ -229,7 +234,7 @@ const server = http.createServer(async (req, res) => {
       run.exitSignal = signal;
       finish(run);
     });
-    return json(res, 202, { started: true, id: run.id, scenario: run.scenario, target: run.target, vus: run.vus, durationSeconds: run.durationSeconds });
+    return json(res, 202, { started: true, id: run.id, scenario: run.scenario, target: run.target, mode: run.mode, requestsPerSecond: run.requestsPerSecond, vus: run.vus, effectiveVUs: run.effectiveVUs, preAllocatedVUs: run.preAllocatedVUs, maxVUs: run.maxVUs, durationSeconds: run.durationSeconds });
   }
 });
 

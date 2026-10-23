@@ -5,5 +5,5 @@
   "description": "Internal HTTP control service for predefined SFM k6 load tests",
   "main": "server.js",
   "engines": { "node": ">=22 <23" },
-  "scripts": { "start": "node server.js" }
+  "scripts": { "start": "node server.js", "test": "node --test" }
 }
