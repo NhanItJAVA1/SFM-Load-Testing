@@ -11,6 +11,7 @@ const SCRIPT = path.resolve(__dirname, '..', 'scripts', 'load-test.js');
 const MAX_TEST_MS = 60 * 60 * 1000 + 30 * 1000;
 const STOP_GRACE_MS = 5000;
 const OUTPUT_LIMIT = 4096;
+const MAX_VUS = 1000;
 const scenarios = Object.freeze({
   smoke: { vus: 1, durationSeconds: 30 },
   load: { vus: 10, durationSeconds: 300 },
@@ -172,8 +173,8 @@ const server = http.createServer(async (req, res) => {
     if (!Object.hasOwn(body, 'scenario') || !Object.hasOwn(body, 'target')) return reject(res, req, 400, 'MISSING_REQUIRED_FIELD', 'scenario_and_target_are_required', 'scenario and target are required', { required: ['scenario', 'target'] });
     if (!Object.hasOwn(scenarios, body.scenario)) return reject(res, req, 400, 'UNKNOWN_SCENARIO', 'scenario_not_allowlisted', 'Unknown scenario', { allowed: Object.keys(scenarios) });
     if (!targets.has(body.target)) return reject(res, req, 400, 'UNKNOWN_TARGET', 'target_not_allowlisted', 'Unknown target', { allowed: [...targets] });
-    if (body.vus !== undefined && (!Number.isInteger(body.vus) || body.vus < 1 || body.vus > 100)) {
-      return reject(res, req, 400, 'INVALID_VUS', 'vus_must_be_integer_in_range', 'vus must be an integer from 1 to 100', { field: 'vus', minimum: 1, maximum: 100 });
+    if (body.vus !== undefined && (!Number.isInteger(body.vus) || body.vus < 1 || body.vus > MAX_VUS)) {
+      return reject(res, req, 400, 'INVALID_VUS', 'vus_must_be_integer_in_range', `vus must be an integer from 1 to ${MAX_VUS}`, { field: 'vus', minimum: 1, maximum: MAX_VUS });
     }
     if (body.durationSeconds !== undefined && (!Number.isInteger(body.durationSeconds) || body.durationSeconds < 10 || body.durationSeconds > 3600)) {
       return reject(res, req, 400, 'INVALID_DURATION_SECONDS', 'duration_seconds_must_be_integer_in_range', 'durationSeconds must be an integer from 10 to 3600', { field: 'durationSeconds', minimum: 10, maximum: 3600 });

@@ -15,6 +15,7 @@ const endpoints = {
 const scenarioName = __ENV.SCENARIO;
 const targetName = __ENV.TARGET;
 const baseUrl = __ENV.BASE_URL || 'http://sfm-be:8080';
+const MAX_VUS = 1000;
 const defaults = scenarios[scenarioName];
 const vus = __ENV.VUS === undefined ? defaults?.vus : Number(__ENV.VUS);
 const durationSeconds = __ENV.DURATION_SECONDS === undefined ? defaults?.durationSeconds : Number(__ENV.DURATION_SECONDS);
@@ -22,8 +23,8 @@ const durationSeconds = __ENV.DURATION_SECONDS === undefined ? defaults?.duratio
 if (!Object.hasOwn(scenarios, scenarioName) || !Object.hasOwn(endpoints, targetName)) {
   throw new Error('Runner supplied an invalid scenario or target');
 }
-if (!Number.isInteger(vus) || vus < 1 || vus > 100 || !Number.isInteger(durationSeconds) || durationSeconds < 10 || durationSeconds > 3600) {
-  throw new Error('Runner supplied invalid VU or duration limits');
+if (!Number.isInteger(vus) || vus < 1 || vus > MAX_VUS || !Number.isInteger(durationSeconds) || durationSeconds < 10 || durationSeconds > 3600) {
+  throw new Error('Runner supplied invalid limits: VUS must be an integer from 1 to 1000 and DURATION_SECONDS from 10 to 3600');
 }
 if (!/^http:\/\/(sfm-backend|sfm-be|localhost|host\.docker\.internal)(:\d+)?$/.test(baseUrl)) {
   throw new Error('BASE_URL must use an allowlisted local SFM-BE host');
