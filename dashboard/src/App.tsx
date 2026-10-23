@@ -172,6 +172,14 @@ export function App() {
   const isRunning = Boolean(run?.running);
   const metrics = run?.metrics || EMPTY_METRICS;
   const statusClass = useMemo(() => `status-pill status-${run?.status || 'idle'}`, [run?.status]);
+  const progressStart = run?.startedAt ? Date.parse(run.startedAt) : NaN;
+  const progressEnd = run?.running ? Date.now() : run?.finishedAt ? Date.parse(run.finishedAt) : NaN;
+  const hasProgress = Number.isFinite(progressStart) && Number.isFinite(progressEnd)
+    && Number.isInteger(run?.durationSeconds) && (run?.durationSeconds ?? 0) > 0;
+  const elapsedSeconds = hasProgress ? Math.max(0, Math.floor((progressEnd - progressStart) / 1000)) : 0;
+  const progressPercent = hasProgress
+    ? Math.min(100, Math.max(0, (elapsedSeconds / (run!.durationSeconds!)) * 100))
+    : 0;
   const chartRuns = useMemo(() => {
     const byId = new Map(history.filter((item) => item.testId).map((item) => [item.testId!, item]));
     if (run?.testId && run.status !== 'idle') byId.set(run.testId, run);
@@ -254,6 +262,15 @@ export function App() {
       <section className="panel results-panel">
         <div className="panel-heading"><div><div className="eyebrow">LIVE RESULT</div><h2>Run overview</h2></div><span className={statusClass}>{run?.status || 'idle'}</span></div>
         {run?.testId ? <><div className="run-meta"><div><span>Test ID</span><code>{run.testId}</code></div><div><span>Scenario · mode</span><b>{run.scenario} · {run.mode}</b></div><div><span>Started</span><b>{formatTime(run.startedAt)}</b></div></div>
+          {hasProgress && run.durationSeconds ? <div className="execution-progress">
+            <div className="progress-heading"><b>Test progress</b><span>{Math.round(progressPercent)}%</span></div>
+            <div className="progress-track" role="progressbar" aria-label="Elapsed test duration" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progressPercent)}>
+              <div className={`progress-fill${run.status === 'failed' ? ' progress-failed' : ''}`} style={{ width: `${progressPercent}%` }} />
+            </div>
+            <small>{elapsedSeconds} / {run.durationSeconds} seconds. {run.running
+              ? (progressPercent >= 100 ? 'Configured duration reached; waiting for Runner to confirm the result.' : 'Progress shows elapsed time; Runner status confirms completion.')
+              : `${run.status === 'completed' ? 'Completed' : run.status === 'stopped' ? 'Stopped' : run.status === 'failed' ? 'Failed' : 'Finished'} · ${formatTime(run.finishedAt)}`}</small>
+          </div> : null}
           <div className="metric-grid">
             <Metric label="Throughput" value={formatValue(metrics.throughputRps, 3)} unit="req/s" accent />
             <Metric label="Average latency" value={formatValue(metrics.averageLatencyMs, 2)} unit="ms" />
