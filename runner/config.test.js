@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { calculateRateVUs, validateStartConfig } = require('./config');
+const { calculateRateVUs, validateProductionLimits, validateProductionStart, validateStartConfig } = require('./config');
 
 test('legacy requests retain scenario defaults and use concurrent_users mode', () => {
   const expected = { smoke: [1, 30], load: [10, 300], stress: [25, 600], spike: [50, 120] };
@@ -65,6 +65,33 @@ test('duration range remains 10 to 3600 seconds', () => {
   assert.equal(validateStartConfig({ scenario: 'smoke', target: 'ping', durationSeconds: 3600 }).value.durationSeconds, 3600);
   assert.equal(validateStartConfig({ scenario: 'smoke', target: 'ping', durationSeconds: 9 }).error.code, 'INVALID_DURATION_SECONDS');
   assert.equal(validateStartConfig({ scenario: 'smoke', target: 'ping', durationSeconds: 3601 }).error.code, 'INVALID_DURATION_SECONDS');
+});
+
+test('Production limits are checked independently from general Runner limits', () => {
+  const limits = { vus: 25, requestsPerSecond: 25, durationSeconds: 120 };
+  assert.equal(validateProductionLimits(validateStartConfig({ scenario: 'smoke', target: 'ping', vus: 25, durationSeconds: 120 }).value, limits), null);
+  const tooManyVus = validateProductionLimits(validateStartConfig({ scenario: 'smoke', target: 'ping', vus: 26 }).value, limits);
+  assert.equal(tooManyVus.error.code, 'PRODUCTION_LIMIT_EXCEEDED');
+  assert.equal(tooManyVus.error.details.field, 'vus');
+  const tooLong = validateProductionLimits(validateStartConfig({ scenario: 'smoke', target: 'ping', durationSeconds: 121 }).value, limits);
+  assert.equal(tooLong.error.details.field, 'durationSeconds');
+  const tooFast = validateProductionLimits(validateStartConfig({ scenario: 'smoke', target: 'ping', mode: 'request_rate', requestsPerSecond: 26 }).value, limits);
+  assert.equal(tooFast.error.details.field, 'requestsPerSecond');
+});
+
+test('Production targets require explicit confirmation and enforce limits inside Runner validation', () => {
+  const hosts = new Set(['sfmbe.duckdns.org']);
+  const limits = { vus: 25, requestsPerSecond: 25, durationSeconds: 120 };
+  const production = validateStartConfig({ scenario: 'smoke', target: 'ping', baseUrl: 'https://sfmbe.duckdns.org', vus: 1 }, 1000,
+    new Set(['sfmbe.duckdns.org']), 'https://sfmbe.duckdns.org').value;
+  assert.equal(validateProductionStart(production, undefined, false, hosts, limits).error.code, 'PRODUCTION_CONFIRMATION_REQUIRED');
+  assert.equal(validateProductionStart(production, true, true, hosts, limits), null);
+  const tooMany = validateStartConfig({ scenario: 'smoke', target: 'ping', baseUrl: 'https://sfmbe.duckdns.org', vus: 26 }, 1000,
+    new Set(['sfmbe.duckdns.org']), 'https://sfmbe.duckdns.org').value;
+  assert.equal(validateProductionStart(tooMany, true, true, hosts, limits).error.code, 'PRODUCTION_LIMIT_EXCEEDED');
+  const local = validateStartConfig({ scenario: 'smoke', target: 'ping' }).value;
+  assert.equal(validateProductionStart(local, true, true, hosts, limits).error.code, 'UNKNOWN_PARAMETER');
+  assert.equal(validateProductionStart(production, 'true', true, hosts, limits).error.code, 'INVALID_PRODUCTION_CONFIRMATION');
 });
 
 test('target base URLs must be exact allowed local or staging origins', () => {

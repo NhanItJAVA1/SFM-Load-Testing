@@ -7,8 +7,11 @@ RUN npm run build
 
 FROM node:22-alpine
 ENV NODE_ENV=production PORT=4173
+RUN apk add --no-cache openssh-client
 WORKDIR /app
 COPY dashboard/server.js ./dashboard/server.js
+COPY dashboard/environments.js ./dashboard/environments.js
+COPY dashboard/environment-manager.js ./dashboard/environment-manager.js
 COPY runner/config.js ./runner/config.js
 COPY --from=build /dashboard/dist ./dashboard/dist
 USER node

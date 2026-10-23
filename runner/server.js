@@ -4,7 +4,7 @@ const http = require('node:http');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { validateStartConfig, HARD_MAX_REQUESTS_PER_SECOND, DEFAULT_TARGET_HOSTS } = require('./config');
+const { validateStartConfig, validateProductionStart, HARD_MAX_REQUESTS_PER_SECOND, DEFAULT_TARGET_HOSTS } = require('./config');
 const { emptyMetrics, parseK6Summary } = require('./metrics');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -16,6 +16,14 @@ const OUTPUT_LIMIT = 4096;
 const MAX_REQUESTS_PER_SECOND = Number(process.env.RUNNER_MAX_REQUESTS_PER_SECOND || HARD_MAX_REQUESTS_PER_SECOND);
 const TARGET_HOSTS = new Set((process.env.RUNNER_ALLOWED_TARGET_HOSTS || DEFAULT_TARGET_HOSTS.join(','))
   .split(',').map((host) => host.trim().toLowerCase().replace(/^\[|\]$/g, '')).filter(Boolean));
+const PRODUCTION_TARGET_HOSTS = new Set((process.env.RUNNER_PRODUCTION_TARGET_HOSTS || 'sfmbe.duckdns.org')
+  .split(',').map((host) => host.trim().toLowerCase().replace(/^\[|\]$/g, '')).filter(Boolean));
+const PRODUCTION_BACKEND_URL = process.env.PRODUCTION_BACKEND_URL || 'https://sfmbe.duckdns.org';
+const PRODUCTION_LIMITS = {
+  vus: Number(process.env.RUNNER_PRODUCTION_MAX_VUS || 25),
+  requestsPerSecond: Math.min(Number(process.env.RUNNER_PRODUCTION_MAX_REQUESTS_PER_SECOND || 25), MAX_REQUESTS_PER_SECOND),
+  durationSeconds: Number(process.env.RUNNER_PRODUCTION_MAX_DURATION_SECONDS || 120),
+};
 const DEFAULT_TARGET_BASE_URL = process.env.SFM_BE_URL || 'http://sfm-backend:8080';
 let active = null;
 let latest = null;
@@ -26,6 +34,22 @@ if (!TOKEN || TOKEN.length < 32) {
 }
 if (!Number.isInteger(MAX_REQUESTS_PER_SECOND) || MAX_REQUESTS_PER_SECOND < 1 || MAX_REQUESTS_PER_SECOND > HARD_MAX_REQUESTS_PER_SECOND) {
   console.error(`RUNNER_MAX_REQUESTS_PER_SECOND must be an integer from 1 to ${HARD_MAX_REQUESTS_PER_SECOND}.`);
+  process.exit(1);
+}
+try {
+  const productionUrl = new URL(PRODUCTION_BACKEND_URL);
+  if (productionUrl.protocol !== 'https:' || productionUrl.username || productionUrl.password
+    || productionUrl.pathname !== '/' || productionUrl.search || productionUrl.hash) throw new Error();
+  PRODUCTION_TARGET_HOSTS.add(productionUrl.hostname.toLowerCase());
+  if (!TARGET_HOSTS.has(productionUrl.hostname.toLowerCase())) throw new Error();
+} catch {
+  console.error('PRODUCTION_BACKEND_URL must be an HTTPS origin whose hostname is in RUNNER_ALLOWED_TARGET_HOSTS.');
+  process.exit(1);
+}
+if (Object.values(PRODUCTION_LIMITS).some((limit) => !Number.isInteger(limit) || limit < 1)
+  || PRODUCTION_LIMITS.vus > 1000 || PRODUCTION_LIMITS.requestsPerSecond > MAX_REQUESTS_PER_SECOND
+  || PRODUCTION_LIMITS.durationSeconds > 3600) {
+  console.error('Production limits must be positive integers within the Runner hard limits.');
   process.exit(1);
 }
 
@@ -183,7 +207,8 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req).catch((e) => e);
     if (body instanceof Error) return reject(res, req, body.status || 400, 'INVALID_JSON', 'body_must_be_valid_json', body.message);
     if (body === null || Array.isArray(body) || typeof body !== 'object') return reject(res, req, 400, 'INVALID_REQUEST_BODY', 'body_must_be_json_object', 'Body must be a JSON object');
-    const validated = validateStartConfig(body, MAX_REQUESTS_PER_SECOND, TARGET_HOSTS, DEFAULT_TARGET_BASE_URL);
+    const { confirmProduction, ...configuration } = body;
+    const validated = validateStartConfig(configuration, MAX_REQUESTS_PER_SECOND, TARGET_HOSTS, DEFAULT_TARGET_BASE_URL);
     if (validated.error) {
       const { status, code, reason, message, details } = validated.error;
       return reject(res, req, status, code, reason, message, details, {
@@ -195,7 +220,21 @@ const server = http.createServer(async (req, res) => {
           requestsPerSecondPresent: Object.hasOwn(body, 'requestsPerSecond'),
           durationSecondsPresent: Object.hasOwn(body, 'durationSeconds'),
           baseUrlPresent: Object.hasOwn(body, 'baseUrl'),
+          confirmProductionPresent: Object.hasOwn(body, 'confirmProduction'),
         },
+      });
+    }
+    const productionValidation = validateProductionStart(
+      validated.value,
+      confirmProduction,
+      Object.hasOwn(body, 'confirmProduction'),
+      PRODUCTION_TARGET_HOSTS,
+      PRODUCTION_LIMITS,
+    );
+    if (productionValidation) {
+      const { status, code, reason, message, details } = productionValidation.error;
+      return reject(res, req, status, code, reason, message, details, {
+        payloadShape: { confirmProductionPresent: Object.hasOwn(body, 'confirmProduction') },
       });
     }
     if (active) return reject(res, req, 409, 'TEST_ALREADY_RUNNING', 'single_active_test_limit_reached', 'A test is already running', { testId: active.id });

@@ -25,6 +25,34 @@ function calculateRateVUs(requestsPerSecond) {
   return { preAllocatedVUs, maxVUs };
 }
 
+function validateProductionLimits(config, limits) {
+  if (config.durationSeconds > limits.durationSeconds) {
+    return error(400, 'PRODUCTION_LIMIT_EXCEEDED', 'production_duration_limit_exceeded', `Production duration cannot exceed ${limits.durationSeconds} seconds`, { field: 'durationSeconds', maximum: limits.durationSeconds });
+  }
+  if (config.effectiveVUs > limits.vus) {
+    return error(400, 'PRODUCTION_LIMIT_EXCEEDED', 'production_vus_limit_exceeded', `Production load cannot exceed ${limits.vus} effective VUs`, { field: 'vus', maximum: limits.vus });
+  }
+  if (config.mode === 'request_rate' && config.requestsPerSecond > limits.requestsPerSecond) {
+    return error(400, 'PRODUCTION_LIMIT_EXCEEDED', 'production_rps_limit_exceeded', `Production request rate cannot exceed ${limits.requestsPerSecond} RPS`, { field: 'requestsPerSecond', maximum: limits.requestsPerSecond });
+  }
+  return null;
+}
+
+function validateProductionStart(config, confirmProduction, confirmationPresent, productionHosts, limits) {
+  const hostname = new URL(config.baseUrl).hostname.toLowerCase();
+  const isProductionTarget = productionHosts.has(hostname);
+  if (confirmationPresent && !isProductionTarget) {
+    return error(400, 'UNKNOWN_PARAMETER', 'production_confirmation_only_allowed_for_production_target', 'confirmProduction is only accepted for a configured Production target');
+  }
+  if (confirmationPresent && confirmProduction !== true) {
+    return error(400, 'INVALID_PRODUCTION_CONFIRMATION', 'production_confirmation_must_be_boolean_true', 'confirmProduction must be true for a Production target');
+  }
+  if (isProductionTarget && confirmProduction !== true) {
+    return error(400, 'PRODUCTION_CONFIRMATION_REQUIRED', 'explicit_production_confirmation_required', 'Explicit confirmation is required before a Production load test');
+  }
+  return isProductionTarget ? validateProductionLimits(config, limits) : null;
+}
+
 function normalizeTargetBaseUrl(value, allowedHosts) {
   if (typeof value !== 'string' || value.length > 2048) return null;
   try {
@@ -107,6 +135,8 @@ function validateStartConfig(body, maxRequestsPerSecond = HARD_MAX_REQUESTS_PER_
 
 module.exports = {
   calculateRateVUs,
+  validateProductionLimits,
+  validateProductionStart,
   validateStartConfig,
   HARD_MAX_REQUESTS_PER_SECOND,
   MAX_DURATION_SECONDS,

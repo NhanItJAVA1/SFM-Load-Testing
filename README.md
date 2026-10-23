@@ -1,10 +1,10 @@
 # SFM Performance Lab
 
-Developer-only load-testing workspace for the SFM project. It includes a standalone React + TypeScript + Vite dashboard, an internal authenticated Node Runner, and the existing fixed k6 script/scenarios. Dashboard history is stored in the local browser; Runner state is in memory. No result database is used.
+Developer workspace for SFM. It includes a standalone React + TypeScript + Vite dashboard, an internal authenticated Node Runner, fixed k6 scenarios, and read-only monitoring using the selected environment's Prometheus. Local and Production targets are selected dynamically without restarting containers. Runner state is in memory; dashboard history is kept in the local browser. No result database is used.
 
 ## Start the local dashboard
 
-Prerequisites: Docker Desktop with the `sfm-network` Docker network already present, and a local or staging target API reachable by the Runner container. SFM-BE Admin APIs and Admin FE are not used to start tests. The default URL points at `http://sfm-backend:8080`; when no backend is running, choose a local target API URL that is reachable from Docker, such as `http://host.docker.internal:8080`, and configure its exact origin in `.env`.
+Prerequisites: Docker Desktop with the `sfm-network` Docker network already present, the existing Prometheus attached to that network, and (for Local API tests) a local Backend reachable from Docker. SFM-BE Admin APIs and Admin FE are not used to start tests. Local defaults to `http://host.docker.internal:8080` and Prometheus at `http://sfm-prometheus:9090`.
 
 Create `.env` from the sample and replace the service token with a private random value of at least 32 characters. Example PowerShell setup:
 
@@ -29,9 +29,9 @@ docker compose up -d --build k6-runner performance-lab
 docker compose ps
 ```
 
-Open [http://127.0.0.1:4173](http://127.0.0.1:4173). The dashboard is published only on loopback. The Runner has no published host port and the dashboard can call only its fixed Start, Stop, and Status APIs using a server-side token. It has no Docker socket, command runner, or Prometheus dependency. SFM-BE does not need to be started unless it is the selected test target.
+Open [http://127.0.0.1:4173](http://127.0.0.1:4173). The dashboard is published only on loopback. The Runner has no published host port and the dashboard can call only its fixed Start, Stop, and Status APIs using a server-side token. It has no Docker socket, command runner, arbitrary PromQL input, or arbitrary proxy endpoint. Its Production monitoring endpoint issues fixed read-only PromQL queries. SFM-BE does not need to be running locally when Prometheus already scrapes the deployed Backend.
 
-Target API URLs are full origins only: no path, query, fragment, or embedded credentials. They must appear in `DASHBOARD_ALLOWED_TARGET_URLS` and their exact hostnames must appear in `RUNNER_ALLOWED_TARGET_HOSTS`. The Runner script still maps `ping`, `database`, and `redis` to fixed paths. Configure only local or staging hosts; never add a production target. For example, if a local API is bound to the developer host, set both variables to include `host.docker.internal` and add `http://host.docker.internal:8080` to `DASHBOARD_ALLOWED_TARGET_URLS`.
+The Local / Production selector changes both the k6 target and monitoring Prometheus source. Environment changes are refused while a test is running. The Runner accepts only fixed target names and URLs configured in the allowlist; the k6 script maps those names to fixed paths.
 
 Choose smoke, load, stress, or spike; select concurrent users or request rate; and set VUs/RPS and duration. The results panel displays throughput, average latency, P95 latency, HTTP error rate, completed requests, and dropped iterations from the k6 summary. Recent finished runs are kept in that browser's local storage. JSON and HTML exports contain the Runner status, parsed k6 metrics, and bounded k6 summary diagnostics; they do not claim to contain the full sample stream. Use the standalone k6 JSON output command below when raw samples are needed.
 
@@ -72,9 +72,32 @@ docker compose up -d --build k6-runner performance-lab
 
 After changing Runner or dashboard code, rebuild and recreate the local services with `docker compose up -d --build k6-runner performance-lab`. Optionally set `RUNNER_MAX_REQUESTS_PER_SECOND=500` in `.env` to lower the accepted RPS ceiling; the hard maximum is 1000.
 
-The Runner attaches to an `internal: true` control network and the shared upstream network; Compose does not publish its port. The dashboard reaches Runner over that internal control network and uses a separate bridge network for its loopback-only host port. Do not bind the dashboard to a public interface or route it through an Internet-facing proxy. Only attach trusted internal services to the shared network.
+The Runner attaches to an `internal: true` control network and the shared upstream network; Compose does not publish its port. The dashboard reaches Runner over the internal control network and Prometheus over the shared network; its host port is loopback-only. Do not bind the dashboard to a public interface or route it through an Internet-facing proxy. Only attach trusted internal services to the shared network.
 
-SFM-BE reachability uses Docker DNS and the shared network: `http://sfm-backend:8080`. Configure `SFM_BE_URL` only as one of the runner's allowlisted local host forms (`sfm-backend`, `sfm-be`, `localhost`, or `host.docker.internal`), with an optional port. No production hostname is allowed by the k6 script. For an existing staging Compose stack, set `SFM_DOCKER_NETWORK` to its network and keep the base URL on that private network.
+### Production monitoring in the dashboard
+
+The dashboard reads metrics from the selected Prometheus every 15 seconds using fixed read-only PromQL queries. Local uses `http://sfm-prometheus:9090`. Production uses `http://127.0.0.1:19090`, reached only through an SSH local forward; Prometheus is not published by this project. The dashboard binds on the developer host at `127.0.0.1` only. Production monitoring and Production load generation are separate actions.
+
+### Environment switcher and Production SSH tunnel
+
+Set the actual, verified EC2 SSH endpoint/account and private Prometheus address in the developer's ignored `.env`:
+
+```dotenv
+PRODUCTION_SSH_HOST=<verified-ec2-dns-or-ip>
+PRODUCTION_SSH_USER=<authorized-ssh-user>
+PRODUCTION_PROMETHEUS_REMOTE_HOST=<private-prometheus-host-reachable-from-ec2>
+PRODUCTION_PROMETHEUS_REMOTE_PORT=<private-prometheus-port>
+```
+
+`PRODUCTION_PROMETHEUS_REMOTE_HOST/PORT` must identify the Prometheus endpoint reachable from the SSH server; this project does not assume whether Prometheus is on EC2 loopback, a private Docker network or another private host. The local tunnel endpoint remains `127.0.0.1:19090`. Do not use an Internet-facing Prometheus address.
+
+Place the private key at `secrets/production_key` and a **verified** OpenSSH known_hosts entry at `secrets/known_hosts`. Verify the EC2 host key fingerprint through a trusted source before creating that entry; do not trust an unverified `ssh-keyscan` result. Compose mounts `./secrets` read-only. The dashboard copies the key to a temporary file with mode 0600 for the SSH process and removes it after the tunnel exits; key material is not copied into the image, served to the browser, or logged. Keep the actual key and `.env` out of Git. Production mode is not available until SSH setup succeeds and the Prometheus query API responds successfully. Failed switching rolls back to Local.
+
+Switching modes does not restart containers. To update `.env` values, recreate the dashboard container so Docker applies its environment; secret files in the mounted directory can be replaced without rebuilding. The SSH tunnel uses OpenSSH `StrictHostKeyChecking=yes`, `BatchMode=yes`, and `ExitOnForwardFailure=yes`, binds only to loopback, refuses duplicate processes, detects unexpected exit, and is stopped on Local switch or shutdown.
+
+Production k6 start requires a separate explicit browser confirmation and a server-side confirmation field. Runner independently enforces the production host and default ceilings of 25 effective VUs, 25 requested RPS, and 120 seconds (adjustable downward/upward only within general hard limits). These are safety ceilings, not availability or capacity guarantees. This project does not probe whether the fixed `/api/v1/load-test/{ping,database,redis}` routes are enabled in Production; only run against Production with authorization and after confirming those routes are deliberately available. A missing route will be reported as a failed load test. Production testing must remain a controlled developer action; the management API is host-local, uses same-origin CSRF checks, and Runner requires its private service token.
+
+The Runner reaches Local Backend through Docker host networking (`host.docker.internal:8080`). If your local SFM-BE is instead attached to `sfm-network`, override `LOCAL_BACKEND_URL` with its service/container DNS name and include that hostname in `RUNNER_ALLOWED_TARGET_HOSTS`. Keep `RUNNER_PRODUCTION_TARGET_HOSTS` limited to Production backend hosts. Do not change SFM-BE, EC2, Caddy, SQL Server, or Prometheus deployment for this feature.
 
 ## PowerShell API example
 

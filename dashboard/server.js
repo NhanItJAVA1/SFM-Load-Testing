@@ -3,30 +3,40 @@
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const {
   DEFAULT_TARGET_HOSTS,
   HARD_MAX_REQUESTS_PER_SECOND,
   modeNames,
-  normalizeTargetBaseUrl,
   scenarios,
   targetNames,
   validateStartConfig,
 } = require('../runner/config');
+const { createEnvironmentConfig, validateEnvironmentConfig } = require('./environments');
+const { EnvironmentManager } = require('./environment-manager');
 
 const PORT = Number(process.env.PORT || 4173);
 const RUNNER_BASE_URL = process.env.RUNNER_BASE_URL || 'http://k6-runner:3000';
 const RUNNER_SERVICE_TOKEN = process.env.RUNNER_SERVICE_TOKEN;
+const ENVIRONMENTS = validateEnvironmentConfig(createEnvironmentConfig());
+const environmentManager = new EnvironmentManager(ENVIRONMENTS);
+const CSRF_TOKEN = crypto.randomBytes(32).toString('hex');
+let controlOperation = null;
 const MAX_REQUESTS_PER_SECOND = Number(process.env.RUNNER_MAX_REQUESTS_PER_SECOND || HARD_MAX_REQUESTS_PER_SECOND);
+const PRODUCTION_LIMITS = Object.freeze({
+  ...ENVIRONMENTS.productionLimits,
+  requestsPerSecond: Math.min(ENVIRONMENTS.productionLimits.requestsPerSecond, MAX_REQUESTS_PER_SECOND),
+});
 const ALLOWED_TARGET_HOSTS = new Set((process.env.RUNNER_ALLOWED_TARGET_HOSTS || DEFAULT_TARGET_HOSTS.join(','))
   .split(',').map((host) => host.trim().toLowerCase().replace(/^\[|\]$/g, '')).filter(Boolean));
-const allowedTargetUrls = (process.env.DASHBOARD_ALLOWED_TARGET_URLS || 'http://sfm-backend:8080')
-  .split(',')
-  .map((value) => normalizeTargetBaseUrl(value.trim(), ALLOWED_TARGET_HOSTS))
-  .filter(Boolean);
-const DEFAULT_TARGET_URL = normalizeTargetBaseUrl(
-  process.env.DASHBOARD_DEFAULT_TARGET_URL || allowedTargetUrls[0], ALLOWED_TARGET_HOSTS,
-);
-const TARGET_URLS = [...new Set(allowedTargetUrls)];
+const PRODUCTION_TARGET_HOSTS = new Set((process.env.RUNNER_PRODUCTION_TARGET_HOSTS || 'sfmbe.duckdns.org')
+  .split(',').map((host) => host.trim().toLowerCase().replace(/^\[|\]$/g, '')).filter(Boolean));
+const MONITORING_RANGES = Object.freeze({
+  '15m': { seconds: 900, step: 15 },
+  '1h': { seconds: 3600, step: 30 },
+  '6h': { seconds: 21600, step: 120 },
+  '24h': { seconds: 86400, step: 300 },
+});
 const DIST_DIR = path.join(__dirname, 'dist');
 const MIME_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
 
@@ -35,8 +45,10 @@ function validateEnvironment() {
   if (!Number.isInteger(MAX_REQUESTS_PER_SECOND) || MAX_REQUESTS_PER_SECOND < 1 || MAX_REQUESTS_PER_SECOND > HARD_MAX_REQUESTS_PER_SECOND) {
     throw new Error(`RUNNER_MAX_REQUESTS_PER_SECOND must be an integer from 1 to ${HARD_MAX_REQUESTS_PER_SECOND}.`);
   }
-  if (!TARGET_URLS.length || !DEFAULT_TARGET_URL || !TARGET_URLS.includes(DEFAULT_TARGET_URL)) {
-    throw new Error('Dashboard target URLs must be origins on RUNNER_ALLOWED_TARGET_HOSTS, and the default must be in the allowlist.');
+  for (const name of ['local', 'production']) {
+    const targetHost = new URL(ENVIRONMENTS[name].backendTarget).hostname.toLowerCase();
+    if (!ALLOWED_TARGET_HOSTS.has(targetHost)) throw new Error(`RUNNER_ALLOWED_TARGET_HOSTS must include the ${name} backend host.`);
+    if (name === 'production' && !PRODUCTION_TARGET_HOSTS.has(targetHost)) throw new Error('RUNNER_PRODUCTION_TARGET_HOSTS must include the configured Production backend host.');
   }
   try {
     const runnerUrl = new URL(RUNNER_BASE_URL);
@@ -68,6 +80,15 @@ function validateLocalRequest(req) {
   return req.headers['sec-fetch-site'] !== 'cross-site';
 }
 
+function validateCsrfRequest(req, expectedToken = CSRF_TOKEN) {
+  const origin = req.headers.origin;
+  const token = req.headers['x-sfm-lab-csrf'];
+  if (typeof origin !== 'string' || typeof token !== 'string' || token.length !== expectedToken.length) return false;
+  try { if (new URL(origin).host !== req.headers.host) return false; }
+  catch { return false; }
+  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expectedToken));
+}
+
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let text = '';
@@ -83,15 +104,37 @@ function readJson(req) {
   });
 }
 
-function validateStartRequest(body) {
+function validateStartRequest(body, selectedEnvironment = environmentManager.currentEnvironment) {
   if (!body || Array.isArray(body) || typeof body !== 'object') {
     return { error: { status: 400, code: 'INVALID_REQUEST_BODY', message: 'Body must be a JSON object' } };
   }
-  const baseUrl = body.baseUrl === undefined ? DEFAULT_TARGET_URL : body.baseUrl;
-  if (typeof baseUrl !== 'string' || !TARGET_URLS.includes(baseUrl)) {
-    return { error: { status: 400, code: 'TARGET_URL_NOT_ALLOWLISTED', message: 'Choose an allowed local or staging target API URL' } };
+  const environment = selectedEnvironment;
+  if (body.environment !== environment) {
+    return { error: { status: 409, code: 'ENVIRONMENT_CHANGED', message: 'The selected environment changed. Refresh the dashboard before starting a test.' } };
   }
-  const validated = validateStartConfig({ ...body, baseUrl }, MAX_REQUESTS_PER_SECOND, ALLOWED_TARGET_HOSTS, DEFAULT_TARGET_URL);
+  if (environment === 'production' && body.confirmProduction !== true) {
+    return { error: { status: 400, code: 'PRODUCTION_CONFIRMATION_REQUIRED', message: 'Explicit confirmation is required before a Production load test.' } };
+  }
+  const baseUrl = ENVIRONMENTS[environment].backendTarget;
+  if (body.baseUrl !== undefined && body.baseUrl !== baseUrl) {
+    return { error: { status: 400, code: 'TARGET_URL_NOT_ALLOWED_FOR_ENVIRONMENT', message: 'The selected environment controls the test target.' } };
+  }
+  const runnerBody = { ...body, baseUrl };
+  delete runnerBody.environment;
+  delete runnerBody.confirmProduction;
+  const validated = validateStartConfig(runnerBody, MAX_REQUESTS_PER_SECOND, ALLOWED_TARGET_HOSTS, baseUrl);
+  if (!validated.error && environment === 'production') {
+    const config = validated.value;
+    if (config.durationSeconds > PRODUCTION_LIMITS.durationSeconds) {
+      return { error: { status: 400, code: 'PRODUCTION_LIMIT_EXCEEDED', message: `Production duration cannot exceed ${PRODUCTION_LIMITS.durationSeconds} seconds.`, details: { field: 'durationSeconds', maximum: PRODUCTION_LIMITS.durationSeconds } } };
+    }
+    if (config.effectiveVUs > PRODUCTION_LIMITS.vus) {
+      return { error: { status: 400, code: 'PRODUCTION_LIMIT_EXCEEDED', message: `Production load cannot exceed ${PRODUCTION_LIMITS.vus} effective VUs.`, details: { field: 'vus', maximum: PRODUCTION_LIMITS.vus } } };
+    }
+    if (config.mode === 'request_rate' && config.requestsPerSecond > PRODUCTION_LIMITS.requestsPerSecond) {
+      return { error: { status: 400, code: 'PRODUCTION_LIMIT_EXCEEDED', message: `Production request rate cannot exceed ${PRODUCTION_LIMITS.requestsPerSecond} RPS.`, details: { field: 'requestsPerSecond', maximum: PRODUCTION_LIMITS.requestsPerSecond } } };
+    }
+  }
   return validated.error ? validated : { value: { ...validated.value, baseUrl } };
 }
 
@@ -110,37 +153,156 @@ async function runnerRequest(method, route, body) {
   return { status: response.status, payload };
 }
 
+async function prometheusRequest(baseUrl, pathname, parameters) {
+  const url = new URL(pathname, `${baseUrl.replace(/\/$/, '')}/`);
+  for (const [key, value] of Object.entries(parameters)) url.searchParams.set(key, String(value));
+  const response = await fetch(url, { signal: AbortSignal.timeout(8000), headers: { accept: 'application/json' } });
+  if (!response.ok) throw new Error('Prometheus returned an unsuccessful response');
+  const body = await response.json();
+  if (body?.status !== 'success' || !Array.isArray(body?.data?.result)) throw new Error('Prometheus returned an invalid query response');
+  return body.data.result;
+}
+
+function vectorValue(result) {
+  const raw = result?.[0]?.value?.[1];
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+function healthState(value) {
+  if (value === null) return 'unknown';
+  return value >= 1 ? 'healthy' : 'unhealthy';
+}
+
+function monitoringQueries(job) {
+  const selector = `{job="${job}"}`;
+  const count = `http_server_request_duration_seconds_count${selector}`;
+  const buckets = `http_server_request_duration_seconds_bucket${selector}`;
+  return {
+    requestsPerSecond: `sum(rate(${count}[5m]))`,
+    p95LatencyMilliseconds: `histogram_quantile(0.95, sum by (le) (rate(${buckets}[5m]))) * 1000`,
+    http5xxErrorRatePercent: `100 * sum(rate(http_server_request_duration_seconds_count${selector.replace('}', ',http_response_status_code=~"5.."}')}[5m])) / sum(rate(${count}[5m]))`,
+    apiAvailabilityPercent: `100 * avg_over_time(up${selector}[5m])`,
+    apiHealth: `up${selector}`,
+    sqlServerHealth: `sfm_dependency_health{dependency="sqlserver",job="${job}"}`,
+    redisHealth: `sfm_dependency_health{dependency="redis",job="${job}"}`,
+  };
+}
+
+async function getEnvironmentMonitoring(rangeName, environmentName) {
+  const range = MONITORING_RANGES[rangeName];
+  const definition = ENVIRONMENTS[environmentName];
+  const queryBaseUrl = definition.prometheusUrl;
+  const queries = monitoringQueries(ENVIRONMENTS.metricsJob);
+  const end = Date.now() / 1000;
+  const start = end - range.seconds;
+  const timeRange = { start, end, step: `${range.step}s` };
+  const names = ['requestsPerSecond', 'p95LatencyMilliseconds', 'http5xxErrorRatePercent'];
+  const [overviewResults, seriesResults] = await Promise.all([
+    Promise.all(Object.entries(queries).map(async ([name, query]) => [name, vectorValue(await prometheusRequest(queryBaseUrl, '/api/v1/query', { query }))])),
+    Promise.all(names.map(async (name) => [name, await prometheusRequest(queryBaseUrl, '/api/v1/query_range', { ...timeRange, query: queries[name] })])),
+  ]);
+  const overview = Object.fromEntries(overviewResults);
+  const history = Object.fromEntries(seriesResults.map(([name, result]) => {
+    const points = (result?.[0]?.values || []).flatMap((sample) => {
+      const timestamp = Number(sample?.[0]);
+      const parsed = Number(sample?.[1]);
+      if (!Number.isFinite(timestamp)) return [];
+      return [{ timestampUtc: new Date(timestamp * 1000).toISOString(), value: Number.isFinite(parsed) ? parsed : null }];
+    });
+    return [name, points];
+  }));
+  return {
+    observedAtUtc: new Date().toISOString(),
+    environment: environmentName,
+    range: rangeName,
+    stepSeconds: range.step,
+    overview: {
+      requestsPerSecond: overview.requestsPerSecond,
+      p95LatencyMilliseconds: overview.p95LatencyMilliseconds,
+      http5xxErrorRatePercent: overview.http5xxErrorRatePercent,
+      apiAvailabilityPercent: overview.apiAvailabilityPercent,
+      apiHealth: healthState(overview.apiHealth),
+      sqlServerHealth: healthState(overview.sqlServerHealth),
+      redisHealth: healthState(overview.redisHealth),
+    },
+    history,
+  };
+}
+
 async function handleApi(req, res, pathname) {
   if (req.method === 'GET' && pathname === '/api/config') {
     return sendJson(res, 200, {
       scenarios,
       targets: targetNames,
       modes: modeNames,
-      targetUrls: TARGET_URLS,
-      defaultTargetUrl: DEFAULT_TARGET_URL,
       maxVus: 1000,
       minDurationSeconds: 10,
       maxDurationSeconds: 3600,
       maxRequestsPerSecond: MAX_REQUESTS_PER_SECOND,
+      productionLimits: PRODUCTION_LIMITS,
+      csrfToken: CSRF_TOKEN,
     });
+  }
+  if (req.method === 'GET' && pathname === '/api/environment') return sendJson(res, 200, await environmentManager.status());
+  if (req.method === 'GET' && pathname === '/api/prometheus/status') {
+    const environment = new URL(req.url, 'http://localhost').searchParams.get('environment') || environmentManager.currentEnvironment;
+    return sendJson(res, 200, await environmentManager.check(environment));
   }
   if (req.method === 'GET' && pathname === '/api/status') {
     const response = await runnerRequest('GET', 'status');
-    return sendJson(res, response.status, response.payload);
+    const payload = response.payload && typeof response.payload === 'object'
+      ? { ...response.payload, environment: Object.keys(ENVIRONMENTS).find((name) => ENVIRONMENTS[name]?.backendTarget === response.payload.targetApiUrl) || null }
+      : response.payload;
+    return sendJson(res, response.status, payload);
+  }
+  if (req.method === 'GET' && pathname === '/api/monitoring') {
+    const rangeName = new URL(req.url, 'http://localhost').searchParams.get('range') || '15m';
+    if (!Object.hasOwn(MONITORING_RANGES, rangeName)) {
+      return sendJson(res, 400, { error: { code: 'INVALID_MONITORING_RANGE', message: 'Choose one of the supported ranges: 15m, 1h, 6h, 24h.' } });
+    }
+    try { return sendJson(res, 200, await getEnvironmentMonitoring(rangeName, environmentManager.currentEnvironment)); }
+    catch { return sendJson(res, 502, { error: { code: 'PROMETHEUS_UNAVAILABLE', message: 'Production monitoring data is temporarily unavailable.' } }); }
+  }
+  if (req.method === 'POST' && pathname === '/api/environment') {
+    if (controlOperation) return sendJson(res, 409, { error: { code: 'CONTROL_OPERATION_IN_PROGRESS', message: 'Wait for the current control operation to finish.' } });
+    controlOperation = 'environment';
+    try {
+      let body;
+      try { body = await readJson(req); }
+      catch (error) { return sendJson(res, error.status || 400, { error: { code: 'INVALID_REQUEST_BODY', message: error.message } }); }
+      if (!body || Array.isArray(body) || typeof body !== 'object' || Object.keys(body).some((key) => key !== 'environment')) {
+        return sendJson(res, 400, { error: { code: 'INVALID_REQUEST_BODY', message: 'Provide only an environment field.' } });
+      }
+      const runner = await runnerRequest('GET', 'status');
+      if (runner.status !== 200) return sendJson(res, 502, { error: { code: 'RUNNER_UNAVAILABLE', message: 'Runner status could not be checked.' } });
+      if (runner.payload?.running) return sendJson(res, 409, { error: { code: 'TEST_RUNNING', message: 'Stop the active k6 test before switching environments.' } });
+      const state = await environmentManager.switchTo(body.environment);
+      return sendJson(res, 200, state);
+    } catch (error) {
+      return sendJson(res, error.status || 502, { error: { code: error.code || 'ENVIRONMENT_SWITCH_FAILED', message: error.message || 'Environment switch failed.' } });
+    } finally { controlOperation = null; }
   }
   if (req.method === 'POST' && pathname === '/api/start') {
-    let body;
-    try { body = await readJson(req); }
-    catch (error) { return sendJson(res, error.status || 400, { error: { code: 'INVALID_REQUEST_BODY', message: error.message } }); }
-    const validated = validateStartRequest(body);
-    if (validated.error) {
-      const { status, code, message, details } = validated.error;
-      return sendJson(res, status, { error: { code, message, ...(details ? { details } : {}) } });
-    }
-    const response = await runnerRequest('POST', 'start', { ...body, baseUrl: validated.value.baseUrl });
-    return sendJson(res, response.status, response.payload);
+    if (controlOperation) return sendJson(res, 409, { error: { code: 'CONTROL_OPERATION_IN_PROGRESS', message: 'Wait for the current control operation to finish.' } });
+    controlOperation = 'start';
+    try {
+      let body;
+      try { body = await readJson(req); }
+      catch (error) { return sendJson(res, error.status || 400, { error: { code: 'INVALID_REQUEST_BODY', message: error.message } }); }
+      const validated = validateStartRequest(body);
+      if (validated.error) {
+        const { status, code, message, details } = validated.error;
+        return sendJson(res, status, { error: { code, message, ...(details ? { details } : {}) } });
+      }
+      const runnerBody = { ...body, baseUrl: validated.value.baseUrl };
+      delete runnerBody.environment;
+      const response = await runnerRequest('POST', 'start', runnerBody);
+      return sendJson(res, response.status, response.payload);
+    } finally { controlOperation = null; }
   }
   if (req.method === 'POST' && pathname === '/api/stop') {
+    if (controlOperation) return sendJson(res, 409, { error: { code: 'CONTROL_OPERATION_IN_PROGRESS', message: 'Wait for the current control operation to finish.' } });
     const response = await runnerRequest('POST', 'stop', {});
     return sendJson(res, response.status, response.payload);
   }
@@ -152,9 +314,10 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   if (url.pathname === '/health' && req.method === 'GET') return sendJson(res, 200, { healthy: true });
   if (url.pathname.startsWith('/api/')) {
+    if (req.method === 'POST' && !validateCsrfRequest(req)) return sendJson(res, 403, { error: { code: 'CSRF_REJECTED', message: 'A same-origin dashboard request is required.' } });
     try { return await handleApi(req, res, url.pathname); }
-    catch {
-      return sendJson(res, 502, { error: { code: 'RUNNER_UNAVAILABLE', message: 'The local k6 Runner could not be reached' } });
+    catch (error) {
+      return sendJson(res, error.status || 502, { error: { code: error.code || 'UPSTREAM_UNAVAILABLE', message: error.status ? error.message : 'The selected upstream service could not be reached.' } });
     }
   }
 
@@ -178,6 +341,11 @@ if (require.main === module) {
   try { validateEnvironment(); }
   catch (error) { console.error(error.message); process.exit(1); }
   server.listen(PORT, '0.0.0.0', () => console.log(`SFM Performance Lab listening on port ${PORT}`));
+  const shutdown = () => {
+    server.close(() => { void environmentManager.dispose().finally(() => process.exit(0)); });
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
 
-module.exports = { validateStartRequest, validateLocalRequest, validateEnvironment, server };
+module.exports = { validateStartRequest, validateLocalRequest, validateCsrfRequest, validateEnvironment, server, environmentManager, getEnvironmentMonitoring, monitoringQueries };
