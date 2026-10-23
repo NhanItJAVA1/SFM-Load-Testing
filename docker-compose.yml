@@ -1,0 +1,32 @@
+services:
+  k6-runner:
+    build: .
+    container_name: sfm-k6-runner
+    environment:
+      PORT: "3000"
+      RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:?Set RUNNER_SERVICE_TOKEN in .env}
+      SFM_BE_URL: ${SFM_BE_URL:-http://sfm-backend:8080}
+      K6_PROMETHEUS_RW_SERVER_URL: ${K6_PROMETHEUS_RW_SERVER_URL:-http://sfm-prometheus:9090/api/v1/write}
+      K6_PROMETHEUS_RW_TREND_STATS: ${K6_PROMETHEUS_RW_TREND_STATS:-p(95)}
+      K6_PROMETHEUS_RW_USERNAME: ${K6_PROMETHEUS_RW_USERNAME:-}
+      K6_PROMETHEUS_RW_PASSWORD: ${K6_PROMETHEUS_RW_PASSWORD:-}
+    networks:
+      - runner-control
+      - sfm-upstream
+    cpus: 1.0
+    mem_limit: 512m
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+networks:
+  runner-control:
+    internal: true
+  sfm-upstream:
+    external: true
+    name: ${SFM_DOCKER_NETWORK:-sfm-network}
